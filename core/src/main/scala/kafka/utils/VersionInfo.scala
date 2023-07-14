@@ -21,7 +21,7 @@ import org.apache.kafka.common.utils.AppInfoParser
 
 object VersionInfo {
 
-  def main(args: Array[String]) {
+  def main(args: Array[String]): Unit = {
     System.out.println(getVersionString)
     System.exit(0)
   }
@@ -35,6 +35,6 @@ object VersionInfo {
   }
 
   def getVersionString: String = {
-    s"${getVersion} (Commit:${getCommit})"
+    s"$getVersion (Commit:$getCommit)"
   }
 }

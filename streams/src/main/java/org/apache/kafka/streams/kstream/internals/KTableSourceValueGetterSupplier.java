@@ -14,16 +14,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.kafka.streams.kstream.internals;
 
-import org.apache.kafka.streams.processor.ProcessorContext;
-import org.apache.kafka.streams.state.TimestampedKeyValueStore;
+import org.apache.kafka.streams.processor.api.ProcessorContext;
 import org.apache.kafka.streams.state.ValueAndTimestamp;
+import org.apache.kafka.streams.state.internals.KeyValueStoreWrapper;
 
 public class KTableSourceValueGetterSupplier<K, V> implements KTableValueGetterSupplier<K, V> {
     private final String storeName;
 
-    KTableSourceValueGetterSupplier(final String storeName) {
+    public KTableSourceValueGetterSupplier(final String storeName) {
         this.storeName = storeName;
     }
 
@@ -37,11 +38,10 @@ public class KTableSourceValueGetterSupplier<K, V> implements KTableValueGetterS
     }
 
     private class KTableSourceValueGetter implements KTableValueGetter<K, V> {
-        private TimestampedKeyValueStore<K, V> store = null;
+        private KeyValueStoreWrapper<K, V> store;
 
-        @SuppressWarnings("unchecked")
-        public void init(final ProcessorContext context) {
-            store = (TimestampedKeyValueStore<K, V>) context.getStateStore(storeName);
+        public void init(final ProcessorContext<?, ?> context) {
+            store = new KeyValueStoreWrapper<>(context, storeName);
         }
 
         public ValueAndTimestamp<V> get(final K key) {
@@ -49,6 +49,13 @@ public class KTableSourceValueGetterSupplier<K, V> implements KTableValueGetterS
         }
 
         @Override
-        public void close() {}
+        public ValueAndTimestamp<V> get(final K key, final long asOfTimestamp) {
+            return store.get(key, asOfTimestamp);
+        }
+
+        @Override
+        public boolean isVersioned() {
+            return store.isVersionedStore();
+        }
     }
 }

@@ -16,7 +16,7 @@
  */
 package org.apache.kafka.connect.runtime;
 
-import org.apache.kafka.connect.runtime.distributed.ClusterConfigState;
+import org.apache.kafka.connect.storage.ClusterConfigState;
 import org.apache.kafka.connect.runtime.distributed.ExtendedAssignment;
 import org.apache.kafka.connect.runtime.distributed.ExtendedWorkerState;
 import org.apache.kafka.connect.util.ConnectorTaskId;
@@ -65,10 +65,14 @@ public class WorkerTestUtils {
                                                         int taskNum) {
         return new ClusterConfigState(
                 offset,
+                null,
                 connectorTaskCounts(1, connectorNum, taskNum),
                 connectorConfigs(1, connectorNum),
                 connectorTargetStates(1, connectorNum, TargetState.STARTED),
                 taskConfigs(0, connectorNum, connectorNum * taskNum),
+                Collections.emptyMap(),
+                Collections.emptyMap(),
+                Collections.emptySet(),
                 Collections.emptySet());
     }
 

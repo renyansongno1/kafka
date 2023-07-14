@@ -16,290 +16,233 @@
  */
 package kafka.admin
 
-import java.io.File
 import java.nio.charset.StandardCharsets
-import java.nio.file.Files
-import java.nio.file.Path
-import kafka.common.AdminCommandFailedException
-import kafka.server.KafkaConfig
-import kafka.server.KafkaServer
-import kafka.utils.TestUtils
-import kafka.zk.ZooKeeperTestHarness
-import org.apache.kafka.clients.admin.AdminClientConfig
-import org.apache.kafka.clients.admin.{AdminClient => JAdminClient}
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.errors.TimeoutException
-import org.apache.kafka.common.errors.UnknownTopicOrPartitionException
-import org.apache.kafka.common.network.ListenerName
-import org.junit.After
-import org.junit.Assert._
-import org.junit.Before
-import org.junit.Test
-import scala.collection.JavaConverters._
-import scala.concurrent.duration._
+import java.nio.file.{Files, Path}
 
-final class LeaderElectionCommandTest extends ZooKeeperTestHarness {
+import kafka.common.AdminCommandFailedException
+import kafka.server.IntegrationTestUtils.createTopic
+import kafka.server.{KafkaConfig, KafkaServer}
+import kafka.test.annotation.{ClusterTest, ClusterTestDefaults, Type}
+import kafka.test.junit.ClusterTestExtensions
+import kafka.test.{ClusterConfig, ClusterInstance}
+import kafka.utils.TestUtils
+import org.apache.kafka.clients.admin.AdminClientConfig
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException
+import org.junit.jupiter.api.Assertions._
+import org.junit.jupiter.api.extension.ExtendWith
+import org.junit.jupiter.api.{BeforeEach, Tag}
+
+@ExtendWith(value = Array(classOf[ClusterTestExtensions]))
+@ClusterTestDefaults(clusterType = Type.ALL, brokers = 3)
+@Tag("integration")
+final class LeaderElectionCommandTest(cluster: ClusterInstance) {
   import LeaderElectionCommandTest._
 
-  var servers = Seq.empty[KafkaServer]
   val broker1 = 0
   val broker2 = 1
   val broker3 = 2
 
-  @Before
-  override def setUp() {
-    super.setUp()
-
-    val brokerConfigs = TestUtils.createBrokerConfigs(3, zkConnect, false)
-    servers = brokerConfigs.map { config =>
-      config.setProperty("auto.leader.rebalance.enable", "false")
-      config.setProperty("controlled.shutdown.enable", "true")
-      config.setProperty("controlled.shutdown.max.retries", "1")
-      config.setProperty("controlled.shutdown.retry.backoff.ms", "1000")
-      TestUtils.createServer(KafkaConfig.fromProps(config))
-    }
+  @BeforeEach
+  def setup(clusterConfig: ClusterConfig): Unit = {
+    TestUtils.verifyNoUnexpectedThreads("@BeforeEach")
+    clusterConfig.serverProperties().put(KafkaConfig.AutoLeaderRebalanceEnableProp, "false")
+    clusterConfig.serverProperties().put(KafkaConfig.ControlledShutdownEnableProp, "true")
+    clusterConfig.serverProperties().put(KafkaConfig.ControlledShutdownMaxRetriesProp, "1")
+    clusterConfig.serverProperties().put(KafkaConfig.ControlledShutdownRetryBackoffMsProp, "1000")
+    clusterConfig.serverProperties().put(KafkaConfig.OffsetsTopicReplicationFactorProp, "2")
   }
 
-  @After
-  override def tearDown() {
-    TestUtils.shutdownServers(servers)
-
-    super.tearDown()
-  }
-
-  @Test
+  @ClusterTest
   def testAllTopicPartition(): Unit = {
-    TestUtils.resource(JAdminClient.create(createConfig(servers).asJava)) { client =>
-      val topic = "unclean-topic"
-      val partition = 0
-      val assignment = Seq(broker2, broker3)
+    val topic = "unclean-topic"
+    val partition = 0
+    val assignment = Seq(broker2, broker3)
 
-      TestUtils.createTopic(zkClient, topic, Map(partition -> assignment), servers)
+    cluster.waitForReadyBrokers()
+    val client = cluster.createAdminClient()
+    createTopic(client, topic, Map(partition -> assignment))
 
-      val topicPartition = new TopicPartition(topic, partition)
+    val topicPartition = new TopicPartition(topic, partition)
 
-      waitForLeaderToBecome(client, topicPartition, Option(broker2))
+    TestUtils.assertLeader(client, topicPartition, broker2)
+    cluster.shutdownBroker(broker3)
+    TestUtils.waitForBrokersOutOfIsr(client, Set(topicPartition), Set(broker3))
+    cluster.shutdownBroker(broker2)
+    TestUtils.assertNoLeader(client, topicPartition)
+    cluster.startBroker(broker3)
+    TestUtils.waitForOnlineBroker(client, broker3)
 
-      servers(broker3).shutdown()
-      waitForBrokerOutOfIsr(client, Set(topicPartition), broker3)
-      servers(broker2).shutdown()
-      waitForLeaderToBecome(client, topicPartition, None)
-      servers(broker3).startup()
-
-      LeaderElectionCommand.main(
-        Array(
-          "--bootstrap-server", bootstrapServers(servers),
-          "--election-type", "unclean",
-          "--all-topic-partitions"
-        )
+    LeaderElectionCommand.main(
+      Array(
+        "--bootstrap-server", cluster.bootstrapServers(),
+        "--election-type", "unclean",
+        "--all-topic-partitions"
       )
+    )
 
-      assertEquals(Option(broker3), currentLeader(client, topicPartition))
-    }
+    TestUtils.assertLeader(client, topicPartition, broker3)
   }
 
-  @Test
+  @ClusterTest
   def testTopicPartition(): Unit = {
-    TestUtils.resource(JAdminClient.create(createConfig(servers).asJava)) { client =>
-      val topic = "unclean-topic"
-      val partition = 0
-      val assignment = Seq(broker2, broker3)
+    val topic = "unclean-topic"
+    val partition = 0
+    val assignment = Seq(broker2, broker3)
 
-      TestUtils.createTopic(zkClient, topic, Map(partition -> assignment), servers)
+    cluster.waitForReadyBrokers()
+    val client = cluster.createAdminClient()
+    createTopic(client, topic, Map(partition -> assignment))
 
-      val topicPartition = new TopicPartition(topic, partition)
+    val topicPartition = new TopicPartition(topic, partition)
 
-      waitForLeaderToBecome(client, topicPartition, Option(broker2))
+    TestUtils.assertLeader(client, topicPartition, broker2)
 
-      servers(broker3).shutdown()
-      waitForBrokerOutOfIsr(client, Set(topicPartition), broker3)
-      servers(broker2).shutdown()
-      waitForLeaderToBecome(client, topicPartition, None)
-      servers(broker3).startup()
+    cluster.shutdownBroker(broker3)
+    TestUtils.waitForBrokersOutOfIsr(client, Set(topicPartition), Set(broker3))
+    cluster.shutdownBroker(broker2)
+    TestUtils.assertNoLeader(client, topicPartition)
+    cluster.startBroker(broker3)
+    TestUtils.waitForOnlineBroker(client, broker3)
 
-      LeaderElectionCommand.main(
-        Array(
-          "--bootstrap-server", bootstrapServers(servers),
-          "--election-type", "unclean",
-          "--topic", topic,
-          "--partition", partition.toString
-        )
+    LeaderElectionCommand.main(
+      Array(
+        "--bootstrap-server", cluster.bootstrapServers(),
+        "--election-type", "unclean",
+        "--topic", topic,
+        "--partition", partition.toString
       )
+    )
 
-      assertEquals(Option(broker3), currentLeader(client, topicPartition))
-    }
+    TestUtils.assertLeader(client, topicPartition, broker3)
   }
 
-  @Test
+  @ClusterTest
   def testPathToJsonFile(): Unit = {
-    TestUtils.resource(JAdminClient.create(createConfig(servers).asJava)) { client =>
-      val topic = "unclean-topic"
-      val partition = 0
-      val assignment = Seq(broker2, broker3)
+    val topic = "unclean-topic"
+    val partition = 0
+    val assignment = Seq(broker2, broker3)
 
-      TestUtils.createTopic(zkClient, topic, Map(partition -> assignment), servers)
+    cluster.waitForReadyBrokers()
+    val client = cluster.createAdminClient()
+    createTopic(client, topic, Map(partition -> assignment))
 
-      val topicPartition = new TopicPartition(topic, partition)
+    val topicPartition = new TopicPartition(topic, partition)
 
-      waitForLeaderToBecome(client, topicPartition, Option(broker2))
+    TestUtils.assertLeader(client, topicPartition, broker2)
 
-      servers(broker3).shutdown()
-      waitForBrokerOutOfIsr(client, Set(topicPartition), broker3)
-      servers(broker2).shutdown()
-      waitForLeaderToBecome(client, topicPartition, None)
-      servers(broker3).startup()
+    cluster.shutdownBroker(broker3)
+    TestUtils.waitForBrokersOutOfIsr(client, Set(topicPartition), Set(broker3))
+    cluster.shutdownBroker(broker2)
+    TestUtils.assertNoLeader(client, topicPartition)
+    cluster.startBroker(broker3)
+    TestUtils.waitForOnlineBroker(client, broker3)
 
-      val topicPartitionPath = tempTopicPartitionFile(Set(topicPartition))
+    val topicPartitionPath = tempTopicPartitionFile(Set(topicPartition))
 
+    LeaderElectionCommand.main(
+      Array(
+        "--bootstrap-server", cluster.bootstrapServers(),
+        "--election-type", "unclean",
+        "--path-to-json-file", topicPartitionPath.toString
+      )
+    )
+
+    TestUtils.assertLeader(client, topicPartition, broker3)
+  }
+
+  @ClusterTest
+  def testPreferredReplicaElection(): Unit = {
+    val topic = "preferred-topic"
+    val partition = 0
+    val assignment = Seq(broker2, broker3)
+
+    cluster.waitForReadyBrokers()
+    val client = cluster.createAdminClient()
+    createTopic(client, topic, Map(partition -> assignment))
+
+    val topicPartition = new TopicPartition(topic, partition)
+
+    TestUtils.assertLeader(client, topicPartition, broker2)
+
+    cluster.shutdownBroker(broker2)
+    TestUtils.assertLeader(client, topicPartition, broker3)
+    cluster.startBroker(broker2)
+    TestUtils.waitForBrokersInIsr(client, topicPartition, Set(broker2))
+
+    LeaderElectionCommand.main(
+      Array(
+        "--bootstrap-server", cluster.bootstrapServers(),
+        "--election-type", "preferred",
+        "--all-topic-partitions"
+      )
+    )
+
+    TestUtils.assertLeader(client, topicPartition, broker2)
+  }
+
+  @ClusterTest
+  def testTopicDoesNotExist(): Unit = {
+    val e = assertThrows(classOf[AdminCommandFailedException], () => LeaderElectionCommand.main(
+      Array(
+        "--bootstrap-server", cluster.bootstrapServers(),
+        "--election-type", "preferred",
+        "--topic", "unknown-topic-name",
+        "--partition", "0"
+      )
+    ))
+    assertTrue(e.getSuppressed()(0).isInstanceOf[UnknownTopicOrPartitionException])
+  }
+
+  @ClusterTest
+  def testElectionResultOutput(): Unit = {
+    val topic = "non-preferred-topic"
+    val partition0 = 0
+    val partition1 = 1
+    val assignment0 = Seq(broker2, broker3)
+    val assignment1 = Seq(broker3, broker2)
+
+    cluster.waitForReadyBrokers()
+    val client = cluster.createAdminClient()
+    createTopic(client, topic, Map(
+      partition0 -> assignment0,
+      partition1 -> assignment1
+    ))
+
+    val topicPartition0 = new TopicPartition(topic, partition0)
+    val topicPartition1 = new TopicPartition(topic, partition1)
+
+    TestUtils.assertLeader(client, topicPartition0, broker2)
+    TestUtils.assertLeader(client, topicPartition1, broker3)
+
+    cluster.shutdownBroker(broker2)
+    TestUtils.assertLeader(client, topicPartition0, broker3)
+    cluster.startBroker(broker2)
+    TestUtils.waitForBrokersInIsr(client, topicPartition0, Set(broker2))
+    TestUtils.waitForBrokersInIsr(client, topicPartition1, Set(broker2))
+
+    val topicPartitionPath = tempTopicPartitionFile(Set(topicPartition0, topicPartition1))
+    val output = TestUtils.grabConsoleOutput(
       LeaderElectionCommand.main(
         Array(
-          "--bootstrap-server", bootstrapServers(servers),
-          "--election-type", "unclean",
+          "--bootstrap-server", cluster.bootstrapServers(),
+          "--election-type", "preferred",
           "--path-to-json-file", topicPartitionPath.toString
         )
       )
+    )
 
-      assertEquals(Option(broker3), currentLeader(client, topicPartition))
-    }
-  }
+    val electionResultOutputIter = output.split("\n").iterator
 
-  @Test
-  def testPreferredReplicaElection(): Unit = {
-    TestUtils.resource(JAdminClient.create(createConfig(servers).asJava)) { client =>
-      val topic = "unclean-topic"
-      val partition = 0
-      val assignment = Seq(broker2, broker3)
+    assertTrue(electionResultOutputIter.hasNext)
+    val firstLine = electionResultOutputIter.next()
+    assertTrue(firstLine.contains(s"Successfully completed leader election (PREFERRED) for partitions $topicPartition0"),
+    s"Unexpected output: $firstLine")
 
-      TestUtils.createTopic(zkClient, topic, Map(partition -> assignment), servers)
-
-      val topicPartition = new TopicPartition(topic, partition)
-
-      waitForLeaderToBecome(client, topicPartition, Option(broker2))
-
-      servers(broker2).shutdown()
-      waitForLeaderToBecome(client, topicPartition, Some(broker3))
-      servers(broker2).startup()
-      waitForBrokerInIsr(client, Set(topicPartition), broker2)
-
-      LeaderElectionCommand.main(
-        Array(
-          "--bootstrap-server", bootstrapServers(servers),
-          "--election-type", "preferred",
-          "--all-topic-partitions"
-        )
-      )
-
-      assertEquals(Option(broker2), currentLeader(client, topicPartition))
-    }
-  }
-
-  @Test
-  def testTopicWithoutPartition(): Unit = {
-    try {
-      LeaderElectionCommand.main(
-        Array(
-          "--bootstrap-server", bootstrapServers(servers),
-          "--election-type", "unclean",
-          "--topic", "some-topic"
-        )
-      )
-      fail()
-    } catch {
-      case e: Throwable =>
-        assertTrue(e.getMessage.startsWith("Missing required option(s)"))
-        assertTrue(e.getMessage.contains(" partition"))
-    }
-  }
-
-  @Test
-  def testPartitionWithoutTopic(): Unit = {
-    try {
-      LeaderElectionCommand.main(
-        Array(
-          "--bootstrap-server", bootstrapServers(servers),
-          "--election-type", "unclean",
-          "--all-topic-partitions",
-          "--partition", "0"
-        )
-      )
-      fail()
-    } catch {
-      case e: Throwable =>
-        assertEquals("Option partition is only allowed if topic is used", e.getMessage)
-    }
-  }
-
-  @Test
-  def testTopicDoesNotExist(): Unit = {
-    try {
-      LeaderElectionCommand.main(
-        Array(
-          "--bootstrap-server", bootstrapServers(servers),
-          "--election-type", "preferred",
-          "--topic", "unknown-topic-name",
-          "--partition", "0"
-        )
-      )
-      fail()
-    } catch {
-      case e: AdminCommandFailedException =>
-        assertTrue(e.getSuppressed()(0).isInstanceOf[UnknownTopicOrPartitionException])
-    }
-  }
-
-  @Test
-  def testMissingElectionType(): Unit = {
-    try {
-      LeaderElectionCommand.main(
-        Array(
-          "--bootstrap-server", bootstrapServers(servers),
-          "--topic", "some-topic",
-          "--partition", "0"
-        )
-      )
-      fail()
-    } catch {
-      case e: Throwable =>
-        assertTrue(e.getMessage.startsWith("Missing required option(s)"))
-        assertTrue(e.getMessage.contains(" election-type"))
-    }
-  }
-
-  @Test
-  def testMissingTopicPartitionSelection(): Unit = {
-    try {
-      LeaderElectionCommand.main(
-        Array(
-          "--bootstrap-server", bootstrapServers(servers),
-          "--election-type", "preferrred"
-        )
-      )
-      fail()
-    } catch {
-      case e: Throwable =>
-        assertTrue(e.getMessage.startsWith("One and only one of the following options is required: "))
-        assertTrue(e.getMessage.contains(" all-topic-partitions"))
-        assertTrue(e.getMessage.contains(" topic"))
-        assertTrue(e.getMessage.contains(" path-to-json-file"))
-    }
-  }
-
-  @Test
-  def testInvalidBroker(): Unit = {
-    try {
-      LeaderElectionCommand.run(
-        Array(
-          "--bootstrap-server", "example.com:1234",
-          "--election-type", "unclean",
-          "--all-topic-partitions"
-        ),
-        1.seconds
-      )
-      fail()
-    } catch {
-      case e: AdminCommandFailedException =>
-        assertTrue(e.getCause.isInstanceOf[TimeoutException])
-    }
+    assertTrue(electionResultOutputIter.hasNext)
+    val secondLine = electionResultOutputIter.next()
+    assertTrue(secondLine.contains(s"Valid replica already elected for partitions $topicPartition1"),
+    s"Unexpected output: $secondLine")
   }
 }
 
@@ -307,62 +250,17 @@ object LeaderElectionCommandTest {
   def createConfig(servers: Seq[KafkaServer]): Map[String, Object] = {
     Map(
       AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG -> bootstrapServers(servers),
-      AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG -> "20000"
+      AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG -> "20000",
+      AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG -> "10000"
     )
   }
 
   def bootstrapServers(servers: Seq[KafkaServer]): String = {
-    servers.map { server =>
-      val port = server.socketServer.boundPort(ListenerName.normalised("PLAINTEXT"))
-      s"localhost:$port"
-    }.headOption.mkString(",")
-  }
-
-  def currentLeader(client: JAdminClient, topicPartition: TopicPartition): Option[Int] = {
-    Option(
-      client
-        .describeTopics(List(topicPartition.topic).asJava)
-        .all
-        .get
-        .get(topicPartition.topic)
-        .partitions
-        .get(topicPartition.partition)
-        .leader
-    ).map(_.id)
-  }
-
-  def waitForLeaderToBecome(client: JAdminClient, topicPartition: TopicPartition, leader: Option[Int]): Unit = {
-    TestUtils.waitUntilTrue(
-      () => currentLeader(client, topicPartition) == leader,
-      s"Expected leader to become $leader", 10000
-    )
-  }
-
-  def waitForBrokerOutOfIsr(client: JAdminClient, partitions: Set[TopicPartition], brokerId: Int): Unit = {
-    TestUtils.waitUntilTrue(
-      () => {
-        val description = client.describeTopics(partitions.map(_.topic).asJava).all.get.asScala
-        val isr = description.values.flatMap(_.partitions.asScala.flatMap(_.isr.asScala))
-        isr.forall(_.id != brokerId)
-      },
-      s"Expect broker $brokerId to no longer be in any ISR for $partitions"
-    )
-  }
-
-  def waitForBrokerInIsr(client: JAdminClient, partitions: Set[TopicPartition], brokerId: Int): Unit = {
-    TestUtils.waitUntilTrue(
-      () => {
-        val description = client.describeTopics(partitions.map(_.topic).asJava).all.get.asScala
-        val isr = description.values.flatMap(_.partitions.asScala.flatMap(_.isr.asScala))
-        isr.exists(_.id == brokerId)
-      },
-      s"Expect broker $brokerId to no longer be in any ISR for $partitions"
-    )
+    TestUtils.plaintextBootstrapServers(servers)
   }
 
   def tempTopicPartitionFile(partitions: Set[TopicPartition]): Path = {
-    val file = File.createTempFile("leader-election-command", ".json")
-    file.deleteOnExit()
+    val file = TestUtils.tempFile("leader-election-command", ".json")
 
     val jsonString = TestUtils.stringifyTopicPartitions(partitions)
 
